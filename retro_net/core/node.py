@@ -6,6 +6,7 @@ import websockets
 from websockets.client import WebSocketClientProtocol
 
 from .exceptions import ConnectionError
+from retro_net.protocols.base import ProtocolPlugin
 
 class Node:
     """Node representing a participant in the retro network."""
@@ -15,13 +16,18 @@ class Node:
         self.node_id: str = node_id
         self.websocket: Optional[WebSocketClientProtocol] = None
         self._running: bool = False
+        self.protocols: Dict[str, ProtocolPlugin] = {}
+
+    def register_protocol(self, protocol: str, plugin: ProtocolPlugin) -> None:
+        """Registers a protocol plugin."""
+        self.protocols[protocol] = plugin
 
     async def connect(self) -> None:
         """Connects to the central switch."""
         try:
             self.websocket = await websockets.connect(self.switch_uri)
             # Register node on connect
-            await self._send_message({"type": "register", "node_id": self.node_id})
+            await self._send_message({"action": "register", "node_id": self.node_id})
         except Exception as e:
             raise ConnectionError(f"Failed to connect to switch at {self.switch_uri}: {e}")
 
@@ -37,19 +43,20 @@ class Node:
             raise ConnectionError("Cannot send message: not connected to switch.")
         await self.websocket.send(json.dumps(message))
 
-    async def send_datagram(self, dest_node: str, payload: bytes) -> None:
+    async def send_datagram(self, dest_node: str, protocol: str, payload: bytes) -> None:
         """
         Sends a datagram to another node.
 
         Args:
             dest_node: The destination node ID.
+            protocol: The protocol identifier (e.g., 'appletalk').
             payload: The binary payload to send.
         """
         encoded_payload = base64.b64encode(payload).decode('utf-8')
         message = {
-            "type": "datagram",
-            "src": self.node_id,
-            "dest": dest_node,
+            "src_node": self.node_id,
+            "dst_node": dest_node,
+            "protocol": protocol,
             "payload": encoded_payload
         }
         await self._send_message(message)
@@ -58,24 +65,27 @@ class Node:
         """Handles an incoming message from the switch."""
         try:
             message = json.loads(message_str)
-            msg_type = message.get("type")
+            dst_node = message.get("dst_node")
 
-            if msg_type == "datagram":
-                src = message.get("src")
+            if dst_node:
+                src_node = message.get("src_node")
+                protocol = message.get("protocol")
                 encoded_payload = message.get("payload")
-                if src and encoded_payload:
-                    payload = base64.b64decode(encoded_payload)
-                    await self._process_incoming_datagram(payload, src)
+
+                if src_node and protocol and encoded_payload:
+                    try:
+                        payload = base64.b64decode(encoded_payload)
+                        if protocol in self.protocols:
+                            await self.protocols[protocol].process_datagram(payload, src_node)
+                        else:
+                            print(f"Unknown protocol: {protocol}")
+                    except Exception as e:
+                        print(f"Failed to decode payload: {e}")
             else:
                 # Handle other message types or log warning
                 pass
         except json.JSONDecodeError:
             pass # Or log error
-
-    async def _process_incoming_datagram(self, payload: bytes, src_node: str) -> None:
-        """Processes an incoming datagram (to be implemented/hooked up)."""
-        # This should eventually pass the datagram to registered ProtocolPlugins
-        pass
 
     async def run(self) -> None:
         """Main event loop for the node."""

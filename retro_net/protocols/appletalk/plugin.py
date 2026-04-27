@@ -12,7 +12,7 @@ class AppleTalkPlugin(ProtocolPlugin):
         self.node = node_ref
 
         # Upper layer callbacks
-        self._registered_handlers: Dict[int, Callable[[bytes, str], Any]] = {}
+        self._registered_handlers: Dict[int, Callable[[bytes, str, int], Any]] = {}
 
         # NBP Registry: (object_name, type_name) -> socket
         self.nbp_registry: Dict[Tuple[str, str], int] = {}
@@ -20,7 +20,7 @@ class AppleTalkPlugin(ProtocolPlugin):
         # Register NBP to handle its own traffic
         self.register_upper_layer(NBP_SOCKET, self._handle_nbp)
 
-    def register_upper_layer(self, port: int, callback: Callable[[bytes, str], Any]) -> None:
+    def register_upper_layer(self, port: int, callback: Callable[[bytes, str, int], Any]) -> None:
         self._registered_handlers[port] = callback
 
     def register_service(self, object_name: str, type_name: str, socket: int) -> None:
@@ -32,6 +32,7 @@ class AppleTalkPlugin(ProtocolPlugin):
         try:
             parsed_header = DDPHeader.parse(payload[:13])
             dest_socket = parsed_header.dest_socket
+            src_socket = parsed_header.src_socket
             data = payload[13:]
 
             if dest_socket in self._registered_handlers:
@@ -40,14 +41,14 @@ class AppleTalkPlugin(ProtocolPlugin):
                 handler = self._registered_handlers[dest_socket]
                 import asyncio
                 if asyncio.iscoroutinefunction(handler):
-                    await handler(data, src_node)
+                    await handler(data, src_node, src_socket)
                 else:
-                    handler(data, src_node)
+                    handler(data, src_node, src_socket)
         except Exception as e:
             # Drop malformed DDP packet
             print(f"DDP Parse error: {e}")
 
-    async def _handle_nbp(self, payload: bytes, src_node: str) -> None:
+    async def _handle_nbp(self, payload: bytes, src_node: str, src_socket: int) -> None:
         """Handle NBP requests."""
         try:
             nbp_packet = NBPHeader.parse(payload)

@@ -19,7 +19,7 @@ class ProtocolPlugin(ABC):
         pass
 
     @abstractmethod
-    def register_upper_layer(self, port: int, callback: Callable[[bytes, str], Any]) -> None:
+    def register_upper_layer(self, port: int, callback: Callable[[bytes, str, int], Any]) -> None:
         """
         Register a callback for an upper-layer protocol or port.
 

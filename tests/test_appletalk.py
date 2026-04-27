@@ -70,10 +70,12 @@ async def test_appletalk_plugin_routing():
     # Register an upper layer service on socket 10
     received_data = []
     received_src = []
+    received_src_socket = []
 
-    async def mock_handler(data: bytes, src: str):
+    async def mock_handler(data: bytes, src: str, src_sock: int):
         received_data.append(data)
         received_src.append(src)
+        received_src_socket.append(src_sock)
 
     plugin.register_upper_layer(10, mock_handler)
 
@@ -92,6 +94,7 @@ async def test_appletalk_plugin_routing():
     assert len(received_data) == 1
     assert received_data[0] == b"TEST"
     assert received_src[0] == "node_B"
+    assert received_src_socket[0] == 11
 
 @pytest.mark.asyncio
 async def test_appletalk_nbp_lookup():

@@ -12,28 +12,28 @@ class Switch:
         self.port: int = port
         self.nodes: Dict[str, WebSocketServerProtocol] = {}
 
-    async def handle_client(self, websocket: WebSocketServerProtocol, path: str) -> None:
+    async def handle_client(self, websocket: WebSocketServerProtocol) -> None:
         """Handles a new client connection."""
         node_id = None
         try:
             async for message in websocket:
                 try:
                     data = json.loads(message) # type: ignore
-                    msg_type = data.get("type")
+                    action = data.get("action")
+                    dest_id = data.get("dst_node")
 
-                    if msg_type == "register":
+                    if action == "register":
                         node_id = data.get("node_id")
                         if node_id:
                             self.nodes[node_id] = websocket
                             print(f"Node {node_id} registered.")
-                    elif msg_type == "datagram":
-                        dest_id = data.get("dest")
-                        if dest_id and dest_id in self.nodes:
+                    elif dest_id:
+                        if dest_id in self.nodes:
                             # Route the message to the destination
                             dest_ws = self.nodes[dest_id]
                             await dest_ws.send(message)
                         else:
-                            print(f"Destination {dest_id} not found or not specified.")
+                            print(f"Destination {dest_id} not found.")
                 except json.JSONDecodeError:
                     print("Received invalid JSON.")
         except websockets.exceptions.ConnectionClosed:

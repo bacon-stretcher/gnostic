@@ -185,11 +185,42 @@ class ADSPTransport(asyncio.Transport):
         self._conn = conn
         self._protocol = protocol
         self._closing = False
+        self._write_buffer_size = 0
+        self._high_water = 65536
+        self._low_water = 16384
+        self._paused = False
+
+    def get_write_buffer_size(self) -> int:
+        return self._write_buffer_size
+
+    def set_write_buffer_limits(self, high: Optional[int] = None, low: Optional[int] = None) -> None:
+        if high is not None:
+            self._high_water = high
+        if low is not None:
+            self._low_water = low
+
+    def _maybe_pause_protocol(self) -> None:
+        if not self._paused and self._write_buffer_size >= self._high_water:
+            self._paused = True
+            self._protocol.pause_writing()
+
+    def _maybe_resume_protocol(self) -> None:
+        if self._paused and self._write_buffer_size <= self._low_water:
+            self._paused = False
+            self._protocol.resume_writing()
 
     def write(self, data: bytes) -> None:
         if not self._closing:
+            self._write_buffer_size += len(data)
+            self._maybe_pause_protocol()
             # We defer actual network sending to the ADSP connection
             asyncio.create_task(self._conn.send_data(data))
+
+    def acknowledge_bytes(self, num_bytes: int) -> None:
+        self._write_buffer_size -= num_bytes
+        if self._write_buffer_size < 0:
+            self._write_buffer_size = 0
+        self._maybe_resume_protocol()
 
     def write_eof(self) -> None:
         self.close()
@@ -231,10 +262,66 @@ class ADSPConnection:
         self.send_window = 0
         self.recv_window = 4096  # Example default receive window size
 
+        # Buffers for unacked data and tracking
+        self.send_buffer = bytearray()
+        self.unacked_seq = 0
+        self.send_next_seq = 0
+
         self.protocol: Optional[asyncio.Protocol] = None
         self.transport: Optional[ADSPTransport] = None
 
         self._open_future: Optional[asyncio.Future[None]] = None
+        self._timer_task: Optional[asyncio.Task] = None
+        self._last_recv_time = asyncio.get_running_loop().time()
+        self._retransmit_interval = 1.0 # seconds
+        self._timeout_interval = 10.0 # seconds
+
+    def _start_timer(self) -> None:
+        if self._timer_task is None:
+            self._timer_task = asyncio.create_task(self._timer_loop())
+
+    def _stop_timer(self) -> None:
+        if self._timer_task is not None:
+            self._timer_task.cancel()
+            self._timer_task = None
+
+    async def _timer_loop(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(self._retransmit_interval)
+                loop_time = asyncio.get_running_loop().time()
+
+                # Check for dead connection
+                if loop_time - self._last_recv_time > self._timeout_interval:
+                    await self._force_close()
+                    break
+
+                if self.state == ADSPState.OPENING:
+                    # Retransmit OPEN_CONN_REQ or OPEN_CONN_REQ_ACK
+                    if self.remote_conn_id == 0:
+                        await self._send_control(ADSPControlCode.OPEN_CONN_REQ)
+                    else:
+                        await self._send_control(ADSPControlCode.OPEN_CONN_REQ_ACK)
+                elif self.state == ADSPState.OPEN:
+                    # Retransmit unacked data
+                    if len(self.send_buffer) > 0:
+                        # Reset send_next_seq to unacked_seq to trigger retransmission of the window
+                        self.send_next_seq = self.unacked_seq
+                        await self._flush_send_buffer()
+                    else:
+                        # Send a probe to keep connection alive and check window
+                        await self._send_control(ADSPControlCode.PROBE_OR_ACK)
+        except asyncio.CancelledError:
+            pass
+
+    async def _force_close(self) -> None:
+        """Close immediately due to timeout."""
+        self.state = ADSPState.CLOSED
+        if self.protocol:
+            self.protocol.connection_lost(None)
+        self.manager.remove_connection(self)
+        if self._open_future and not self._open_future.done():
+            self._open_future.set_exception(ConnectionError("ADSP Connection timed out"))
 
     def set_protocol(self, protocol: asyncio.Protocol) -> None:
         self.protocol = protocol
@@ -243,14 +330,30 @@ class ADSPConnection:
     async def connect(self) -> None:
         """Initiate the 3-way handshake."""
         self.state = ADSPState.OPENING
+        self._last_recv_time = asyncio.get_running_loop().time()
+        self._start_timer()
         self._open_future = asyncio.get_running_loop().create_future()
         await self._send_control(ADSPControlCode.OPEN_CONN_REQ)
         await self._open_future
 
     async def close_connection(self) -> None:
         """Close the connection."""
+        if self.state in (ADSPState.CLOSED, ADSPState.CLOSING):
+            return
+
+        self.state = ADSPState.CLOSING
+
+        # Wait until all send buffer is cleared or we timeout
+        wait_interval = 0.1
+        max_waits = int(self._timeout_interval / wait_interval)
+        waits = 0
+        while len(self.send_buffer) > 0 and waits < max_waits:
+            await asyncio.sleep(wait_interval)
+            waits += 1
+
+        self._stop_timer()
+
         if self.state != ADSPState.CLOSED:
-            self.state = ADSPState.CLOSING
             await self._send_control(ADSPControlCode.CLOSE_CONN)
             self.state = ADSPState.CLOSED
             self.manager.remove_connection(self)
@@ -278,27 +381,51 @@ class ADSPConnection:
         if self.state != ADSPState.OPEN:
             return
 
-        # In a real implementation we would chunk data to fit within window/packet sizes
-        header = {
-            "src_conn_id": self.local_conn_id,
-            "dest_conn_id": self.remote_conn_id,
-            "seq_num": self.send_seq,
-            "ack_num": self.recv_seq,
-            "window_size": self.recv_window,
-            "descriptor": {
-                "control": False,
-                "ack_req": True,
-                "eom": True,
-                "attention": False,
-                "control_code": 0
+        self.send_buffer.extend(data)
+        await self._flush_send_buffer()
+
+    async def _flush_send_buffer(self) -> None:
+        """Flushes data from the send_buffer as long as it fits in the send window."""
+        max_data_len = 586 - ADSPHeader.sizeof()
+
+        while self.send_next_seq < self.unacked_seq + len(self.send_buffer):
+            # Calculate how much we can send based on the remote window
+            bytes_in_flight = self.send_next_seq - self.unacked_seq
+            available_window = self.send_window - bytes_in_flight
+
+            if available_window <= 0:
+                break # We cannot send more data until we receive an ACK
+
+            chunk_size = min(max_data_len, available_window, (self.unacked_seq + len(self.send_buffer)) - self.send_next_seq)
+            if chunk_size == 0:
+                break
+
+            buffer_offset = self.send_next_seq - self.unacked_seq
+            chunk = self.send_buffer[buffer_offset:buffer_offset+chunk_size]
+
+            is_eom = (buffer_offset + chunk_size) >= len(self.send_buffer)
+
+            header = {
+                "src_conn_id": self.local_conn_id,
+                "dest_conn_id": self.remote_conn_id,
+                "seq_num": self.send_seq + buffer_offset,
+                "ack_num": self.recv_seq,
+                "window_size": self.recv_window,
+                "descriptor": {
+                    "control": False,
+                    "ack_req": True,
+                    "eom": is_eom,
+                    "attention": False,
+                    "control_code": 0
+                }
             }
-        }
-        encoded = ADSPHeader.build(header) + data
-        self.send_seq += len(data)
-        await self.manager.send_packet(self.dest_node, self.dest_socket, self.local_socket, encoded)
+            encoded = ADSPHeader.build(header) + chunk
+            self.send_next_seq += len(chunk)
+            await self.manager.send_packet(self.dest_node, self.dest_socket, self.local_socket, encoded)
 
     async def process_packet(self, header: Any, data: bytes) -> None:
         """Process incoming packets for this connection."""
+        self._last_recv_time = asyncio.get_running_loop().time()
         if header.descriptor.control:
             await self._process_control(header)
         else:
@@ -312,6 +439,7 @@ class ADSPConnection:
             self.recv_seq = header.seq_num
             self.send_window = header.window_size
             self.state = ADSPState.OPENING
+            self._start_timer()
             await self._send_control(ADSPControlCode.OPEN_CONN_REQ_ACK)
 
         elif self.state == ADSPState.OPENING and code == ADSPControlCode.OPEN_CONN_REQ_ACK:
@@ -326,18 +454,48 @@ class ADSPConnection:
                 self._open_future.set_result(None)
 
         elif self.state == ADSPState.OPENING and code == ADSPControlCode.OPEN_CONN_ACK:
+            self.send_window = header.window_size
             self.state = ADSPState.OPEN
             if self.protocol and self.transport:
                 self.protocol.connection_made(self.transport)
 
+        elif self.state == ADSPState.OPEN and code == ADSPControlCode.PROBE_OR_ACK:
+            self.send_window = header.window_size
+            if header.ack_num > self.unacked_seq:
+                acked_bytes = header.ack_num - self.unacked_seq
+                self.unacked_seq = header.ack_num
+                self.send_seq = self.unacked_seq
+                self.send_buffer = self.send_buffer[acked_bytes:]
+                if self.transport:
+                    self.transport.acknowledge_bytes(acked_bytes)
+
+                # Check if we can send more
+                await self._flush_send_buffer()
+
         elif code == ADSPControlCode.CLOSE_CONN:
-            self.state = ADSPState.CLOSED
-            if self.protocol:
-                self.protocol.connection_lost(None)
-            self.manager.remove_connection(self)
+            if self.state != ADSPState.CLOSED:
+                # We should acknowledge the CLOSE_CONN by sending one back if we haven't already
+                if self.state != ADSPState.CLOSING:
+                    await self._send_control(ADSPControlCode.CLOSE_CONN)
+                self._stop_timer()
+                self.state = ADSPState.CLOSED
+                if self.protocol:
+                    self.protocol.connection_lost(None)
+                self.manager.remove_connection(self)
 
     async def _process_data(self, header: Any, data: bytes) -> None:
         if self.state == ADSPState.OPEN:
+            # We might receive an ACK on a data packet
+            if header.ack_num > self.unacked_seq:
+                self.send_window = header.window_size
+                acked_bytes = header.ack_num - self.unacked_seq
+                self.unacked_seq = header.ack_num
+                self.send_seq = self.unacked_seq
+                self.send_buffer = self.send_buffer[acked_bytes:]
+                if self.transport:
+                    self.transport.acknowledge_bytes(acked_bytes)
+                await self._flush_send_buffer()
+
             # Check seq_num
             if header.seq_num == self.recv_seq:
                 self.recv_seq += len(data)
@@ -345,7 +503,5 @@ class ADSPConnection:
                     self.protocol.data_received(data)
 
                 # If ack_req is true, we should send an ACK.
-                # Since we don't implement the full flow control in this example,
-                # we just send a PROBE_OR_ACK back
                 if header.descriptor.ack_req:
                     await self._send_control(ADSPControlCode.PROBE_OR_ACK)

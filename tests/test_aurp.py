@@ -9,6 +9,23 @@ class MockNode:
     async def send_datagram(self, dest_node: str, protocol: str, payload: bytes) -> None:
         self.sent_datagrams.append((dest_node, protocol, payload))
 
+def test_aurp_domain_identifier_unknown_authority():
+    from retro_net.services.aurp import DomainIdentifier
+    # Test length 6, authority 2 (unknown), id = 4 bytes
+    data = b'\x06\x02\x01\x02\x03\x04'
+    parsed = DomainIdentifier.parse(data)
+    assert parsed.length == 6
+    assert parsed.authority == 2
+    assert parsed.identifier == b'\x01\x02\x03\x04'
+
+    # Test unknown authority with 0 payload
+    data_empty = b'\x02\x05'
+    parsed_empty = DomainIdentifier.parse(data_empty)
+    assert parsed_empty.length == 2
+    assert parsed_empty.authority == 5
+    assert parsed_empty.identifier == b''
+
+
 @pytest.mark.asyncio
 async def test_aurp_bridge_service():
     node = MockNode()

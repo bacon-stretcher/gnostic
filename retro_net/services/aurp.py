@@ -11,7 +11,7 @@ DomainIdentifier = Struct(
     "identifier" / Switch(this.authority, {
         1: Struct("distinguisher" / Int16ub, "ip" / Bytes(4)),
         0: Bytes(0)
-    })
+    }, default=Bytes(lambda ctx: max(0, ctx.length - 2)))
 )
 
 DomainHeader = Struct(

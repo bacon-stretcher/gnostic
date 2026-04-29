@@ -26,6 +26,98 @@ async def test_aurp_bridge_service():
     # Stop the service
     await service.stop()
 
+class UDPReceiverProtocol(asyncio.DatagramProtocol):
+    def __init__(self):
+        self.received = asyncio.Queue()
+
+    def datagram_received(self, data, addr):
+        self.received.put_nowait((data, addr))
+
+@pytest.mark.asyncio
+async def test_aurp_outbound_hook():
+    node = MockNode()
+
+    # Start a dummy UDP receiver to capture the sent packet
+    loop = asyncio.get_running_loop()
+    recv_transport, recv_protocol = await loop.create_datagram_endpoint(
+        UDPReceiverProtocol,
+        local_addr=('127.0.0.1', 0)
+    )
+    dest_ip, dest_port = recv_transport.get_extra_info('sockname')
+
+    service = AURPBridgeService(node, port=0)
+
+    # Add the receiver as a peer
+    service.add_peer(dest_ip, dest_port)
+
+    await service.start()
+
+    payload = b'test_outbound_hook_payload'
+
+    # Trigger the hook by sending a datagram through the node
+    await node.send_datagram('*', 'appletalk', payload)
+
+    # Wait for the packet to be received over UDP
+    received_data, addr = await asyncio.wait_for(recv_protocol.received.get(), timeout=1.0)
+
+    header_length = 22
+    assert len(received_data) == header_length + len(payload)
+
+    received_payload = received_data[header_length:]
+    assert received_payload == payload
+
+    # Check that original send_datagram was also called
+    assert len(node.sent_datagrams) == 1
+    dest_node, protocol, sent_payload = node.sent_datagrams[0]
+    assert dest_node == '*'
+    assert protocol == 'appletalk'
+    assert sent_payload == payload
+
+    await service.stop()
+    recv_transport.close()
+
+    # Verify monkey-patch is restored
+    assert node.send_datagram.__name__ == 'send_datagram'
+
+
+@pytest.mark.asyncio
+async def test_aurp_send_packet():
+    node = MockNode()
+
+    # Start a dummy UDP receiver to capture the sent packet
+    loop = asyncio.get_running_loop()
+    recv_transport, recv_protocol = await loop.create_datagram_endpoint(
+        UDPReceiverProtocol,
+        local_addr=('127.0.0.1', 0)
+    )
+    dest_ip, dest_port = recv_transport.get_extra_info('sockname')
+
+    service = AURPBridgeService(node, port=0)
+    await service.start()
+
+    payload = b'test_outbound_payload'
+    service.send_aurp_packet(dest_ip, dest_port, payload)
+
+    # Wait for the packet to be received
+    received_data, addr = await asyncio.wait_for(recv_protocol.received.get(), timeout=1.0)
+
+    # DomainIdentifier structure (when authority=1):
+    # length (1 byte) + authority (1 byte) + distinguisher (2 bytes) + ip (4 bytes) = 8 bytes total per DI
+    # dest_di (8 bytes) + source_di (8 bytes) + version (2 bytes) + reserved (2 bytes) + packet_type (2 bytes) = 22 bytes
+    header_length = 22
+    assert len(received_data) == header_length + len(payload)
+
+    received_payload = received_data[header_length:]
+    assert received_payload == payload
+
+    # check if dest_di ip matches what we sent (offset 4)
+    import socket
+    expected_dest_ip_bytes = socket.inet_aton(dest_ip)
+    assert received_data[4:8] == expected_dest_ip_bytes
+
+    await service.stop()
+    recv_transport.close()
+
     assert service.transport is None
 
 @pytest.mark.asyncio

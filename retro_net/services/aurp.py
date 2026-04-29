@@ -1,4 +1,5 @@
 import io
+import socket
 import asyncio
 from typing import Any, Tuple
 from construct import Struct, Int8ub, Int16ub, Bytes, Switch, this
@@ -56,6 +57,22 @@ class AURPBridgeService(ServicePlugin):
         self.host = host
         self.transport: asyncio.DatagramTransport | None = None
         self.protocol: AURPProtocol | None = None
+        self.peers: list[Tuple[str, int]] = []
+        self._original_send_datagram = None
+
+    def add_peer(self, ip: str, port: int) -> None:
+        """Add a remote AURP tunnel peer."""
+        self.peers.append((ip, port))
+
+    async def _outbound_hook(self, dest_node: str, protocol: str, payload: bytes) -> None:
+        """Intercept outbound datagrams and forward AppleTalk packets to peers."""
+        if protocol == 'appletalk':
+            for peer_ip, peer_port in self.peers:
+                self.send_aurp_packet(peer_ip, peer_port, payload)
+
+        # Call the original send_datagram
+        if self._original_send_datagram:
+            await self._original_send_datagram(dest_node, protocol, payload)
 
     async def start(self) -> None:
         loop = asyncio.get_running_loop()
@@ -63,10 +80,58 @@ class AURPBridgeService(ServicePlugin):
             lambda: AURPProtocol(self.node),
             local_addr=(self.host, self.port)
         )
+
+        # Monkey-patch node to intercept outbound datagrams
+        if hasattr(self.node, 'send_datagram'):
+            self._original_send_datagram = self.node.send_datagram
+            self.node.send_datagram = self._outbound_hook
+
         print(f"AURPBridgeService started on udp://{self.host}:{self.port}")
 
     async def stop(self) -> None:
         if self.transport:
             self.transport.close()
             self.transport = None
+
+        # Restore original send_datagram
+        if self._original_send_datagram:
+            self.node.send_datagram = self._original_send_datagram
+            self._original_send_datagram = None
+
         print("AURPBridgeService stopped.")
+
+    def send_aurp_packet(self, dest_ip: str, dest_port: int, ddp_payload: bytes) -> None:
+        """
+        Encapsulate a DDP payload in an AURP DomainHeader and send it via UDP.
+        """
+        if not self.transport:
+            print("AURPBridgeService: Cannot send packet, transport is not open.")
+            return
+
+        try:
+            dest_ip_bytes = socket.inet_aton(dest_ip)
+            source_ip_bytes = socket.inet_aton(self.host if self.host != '0.0.0.0' else '127.0.0.1')
+
+            dest_di = {
+                "length": 7,
+                "authority": 1,
+                "identifier": {"distinguisher": 0, "ip": dest_ip_bytes}
+            }
+            source_di = {
+                "length": 7,
+                "authority": 1,
+                "identifier": {"distinguisher": 0, "ip": source_ip_bytes}
+            }
+
+            header = DomainHeader.build({
+                "dest_di": dest_di,
+                "source_di": source_di,
+                "version": 1,
+                "reserved": 0,
+                "packet_type": 2
+            })
+
+            packet = header + ddp_payload
+            self.transport.sendto(packet, (dest_ip, dest_port))
+        except Exception as e:
+            print(f"AURPBridgeService: Error sending packet: {e}")

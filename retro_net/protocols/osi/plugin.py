@@ -19,6 +19,10 @@ class OSIPlugin(ProtocolPlugin):
         # NLPID handlers mapping
         self._registered_handlers: Dict[int, Callable[[bytes, str], Any]] = {}
 
+        # Initialize TP4 Manager
+        from .tp4_manager import TP4Manager
+        self.tp4_manager = TP4Manager(self.node)
+
     def register_upper_layer(self, port: int, callback: Callable[[bytes, str, int], Any]) -> None:
         """
         Register a callback for an upper-layer protocol based on NLPID.
@@ -69,6 +73,13 @@ class OSIPlugin(ProtocolPlugin):
         # For our purposes, we'll assume the payload belongs to TP4 if a handler is registered.
 
         tp4_nlpid = 0x84 # Let's use 0x84 as our internal TP4 port/NLPID representation
+
+        # Route TP4 data to TP4Manager
+        await self.tp4_manager.handle_pdu(data, src_node)
+
+        # If there's an upper layer listener registered for TP4, we might want to notify them
+        # In a complete implementation, TP4Manager would handle this via listening sockets.
+        # For compatibility with existing tests, we also pass raw data to registered handlers.
         if tp4_nlpid in self._registered_handlers:
             handler = self._registered_handlers[tp4_nlpid]
             if asyncio.iscoroutinefunction(handler):

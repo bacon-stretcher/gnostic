@@ -87,6 +87,112 @@ async def test_esis_routing(osi_plugin):
     assert port == NLPID_ESIS
 
 @pytest.mark.asyncio
+async def test_tp4_connection_and_data(osi_plugin):
+    # This test verifies that TP4Manager correctly handles connection establishment,
+    # data transfer, and disconnection.
+
+    # We will simulate "Node B" talking to our osi_plugin (Node A).
+    # Since our mock node just appends datagrams to sent_datagrams, we can inspect them.
+    tp4_manager = osi_plugin.tp4_manager
+
+    # 1. Node B sends CR (Connection Request) to Node A
+    cr_header = TP4Header.build({
+        "length_indicator": 6,
+        "pdu_type": 0xE0, # CR
+        "dst_ref": 0,
+        "src_ref": 500,
+        "class_option": 4,
+        "variable_part": b""
+    })
+    # Wrapped in CLNP
+    clnp_cr = CLNPHeader.build({
+        "nlpid": NLPID_CLNP,
+        "length_indicator": 13,
+        "version": 1,
+        "ttl": 64,
+        "type_flags": 0,
+        "segment_length": 13 + len(cr_header),
+        "checksum": 0,
+        "dest_address_length": 1,
+        "dest_address": b"\x01",
+        "src_address_length": 1,
+        "src_address": b"\x02"
+    })
+
+    await osi_plugin.process_datagram(clnp_cr + cr_header, "node_b")
+
+    # Check that TP4Manager created a connection and sent CC
+    assert len(tp4_manager.connections) == 1
+    local_ref = list(tp4_manager.connections.keys())[0]
+    conn = tp4_manager.connections[local_ref]
+    assert conn.state.name == "ESTABLISHED"
+
+    # Check Node A sent a CC
+    assert len(osi_plugin.node.sent_datagrams) == 1
+    dest, proto, payload = osi_plugin.node.sent_datagrams[-1]
+    assert dest == "node_b"
+
+    # 2. Node B sends Data
+    test_data = b"hello tp4"
+    dt_header = TP4Header.build({
+        "length_indicator": 6,
+        "pdu_type": 0xF0, # DT
+        "dst_ref": local_ref,
+        "src_ref": 500,
+        "class_option": 4,
+        "variable_part": b""
+    })
+    clnp_dt = CLNPHeader.build({
+        "nlpid": NLPID_CLNP,
+        "length_indicator": 13,
+        "version": 1,
+        "ttl": 64,
+        "type_flags": 0,
+        "segment_length": 13 + len(dt_header) + len(test_data),
+        "checksum": 0,
+        "dest_address_length": 1,
+        "dest_address": b"\x01",
+        "src_address_length": 1,
+        "src_address": b"\x02"
+    })
+
+    await osi_plugin.process_datagram(clnp_dt + dt_header + test_data, "node_b")
+
+    # Read data from StreamReader
+    read_data = await conn.reader.read(len(test_data))
+    assert read_data == test_data
+
+    # 3. Node B sends Disconnect Request (DR)
+    dr_header = TP4Header.build({
+        "length_indicator": 6,
+        "pdu_type": 0x80, # DR
+        "dst_ref": local_ref,
+        "src_ref": 500,
+        "class_option": 4,
+        "variable_part": b""
+    })
+    clnp_dr = CLNPHeader.build({
+        "nlpid": NLPID_CLNP,
+        "length_indicator": 13,
+        "version": 1,
+        "ttl": 64,
+        "type_flags": 0,
+        "segment_length": 13 + len(dr_header),
+        "checksum": 0,
+        "dest_address_length": 1,
+        "dest_address": b"\x01",
+        "src_address_length": 1,
+        "src_address": b"\x02"
+    })
+
+    await osi_plugin.process_datagram(clnp_dr + dr_header, "node_b")
+
+    # Connection should be closed and removed
+    assert len(tp4_manager.connections) == 0
+    # Node A should have sent DC
+    assert len(osi_plugin.node.sent_datagrams) == 2
+
+@pytest.mark.asyncio
 async def test_isis_routing(osi_plugin):
     received_data = []
 

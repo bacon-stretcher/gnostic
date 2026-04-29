@@ -1,4 +1,1 @@
 # gnostic
-# gnostic
-# gnostic
-# gnostic

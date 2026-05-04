@@ -55,6 +55,7 @@ class AURPBridgeService(ServicePlugin):
         self.node = node
         self.port = port
         self.host = host
+        self._source_ip_bytes = socket.inet_aton(self.host if self.host != '0.0.0.0' else '127.0.0.1')
         self.transport: asyncio.DatagramTransport | None = None
         self.protocol: AURPProtocol | None = None
         self.peers: list[Tuple[str, int]] = []
@@ -110,7 +111,6 @@ class AURPBridgeService(ServicePlugin):
 
         try:
             dest_ip_bytes = socket.inet_aton(dest_ip)
-            source_ip_bytes = socket.inet_aton(self.host if self.host != '0.0.0.0' else '127.0.0.1')
 
             dest_di = {
                 "length": 7,
@@ -120,7 +120,7 @@ class AURPBridgeService(ServicePlugin):
             source_di = {
                 "length": 7,
                 "authority": 1,
-                "identifier": {"distinguisher": 0, "ip": source_ip_bytes}
+                "identifier": {"distinguisher": 0, "ip": self._source_ip_bytes}
             }
 
             header = DomainHeader.build({

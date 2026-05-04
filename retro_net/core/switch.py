@@ -7,7 +7,7 @@ from websockets.server import WebSocketServerProtocol
 class Switch:
     """A standalone WebSocket server to route JSON between nodes."""
 
-    def __init__(self, host: str = "0.0.0.0", port: int = 8765) -> None:
+    def __init__(self, host: str = "127.0.0.1", port: int = 8765) -> None:
         self.host: str = host
         self.port: int = port
         self.nodes: Dict[str, WebSocketServerProtocol] = {}

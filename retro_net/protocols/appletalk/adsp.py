@@ -266,6 +266,8 @@ class ADSPConnection:
         self.send_buffer = bytearray()
         self.unacked_seq = 0
         self.send_next_seq = 0
+        self._buffer_empty_event = asyncio.Event()
+        self._buffer_empty_event.set()
 
         self.protocol: Optional[asyncio.Protocol] = None
         self.transport: Optional[ADSPTransport] = None
@@ -344,12 +346,11 @@ class ADSPConnection:
         self.state = ADSPState.CLOSING
 
         # Wait until all send buffer is cleared or we timeout
-        wait_interval = 0.1
-        max_waits = int(self._timeout_interval / wait_interval)
-        waits = 0
-        while len(self.send_buffer) > 0 and waits < max_waits:
-            await asyncio.sleep(wait_interval)
-            waits += 1
+        try:
+            if len(self.send_buffer) > 0:
+                await asyncio.wait_for(self._buffer_empty_event.wait(), timeout=self._timeout_interval)
+        except asyncio.TimeoutError:
+            pass
 
         self._stop_timer()
 
@@ -381,6 +382,8 @@ class ADSPConnection:
         if self.state != ADSPState.OPEN:
             return
 
+        if data:
+            self._buffer_empty_event.clear()
         self.send_buffer.extend(data)
         await self._flush_send_buffer()
 
@@ -466,6 +469,8 @@ class ADSPConnection:
                 self.unacked_seq = header.ack_num
                 self.send_seq = self.unacked_seq
                 self.send_buffer = self.send_buffer[acked_bytes:]
+                if len(self.send_buffer) == 0:
+                    self._buffer_empty_event.set()
                 if self.transport:
                     self.transport.acknowledge_bytes(acked_bytes)
 
@@ -492,6 +497,8 @@ class ADSPConnection:
                 self.unacked_seq = header.ack_num
                 self.send_seq = self.unacked_seq
                 self.send_buffer = self.send_buffer[acked_bytes:]
+                if len(self.send_buffer) == 0:
+                    self._buffer_empty_event.set()
                 if self.transport:
                     self.transport.acknowledge_bytes(acked_bytes)
                 await self._flush_send_buffer()

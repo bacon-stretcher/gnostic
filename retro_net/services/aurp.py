@@ -51,7 +51,7 @@ class AURPBridgeService(ServicePlugin):
     Handles tunneling AppleTalk DDP packets over UDP (AURP - AppleTalk Update-Based Routing Protocol).
     """
 
-    def __init__(self, node: Any, port: int = 387, host: str = '0.0.0.0') -> None:
+    def __init__(self, node: Any, port: int = 387, host: str = '127.0.0.1') -> None:
         self.node = node
         self.port = port
         self.host = host
